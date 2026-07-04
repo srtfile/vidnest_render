@@ -3,81 +3,19 @@ import time
 import requests
 from flask import Flask, jsonify, render_template
 from flask_cors import CORS
-from bs4 import BeautifulSoup
-import re
-from urllib.parse import urljoin
 
 app = Flask(__name__)
 CORS(app)
 
-TARGET_URL = "https://srtfile.github.io/vidnest/movie/254"
+API_BASE = "https://srtfile.github.io/vidnest/"
 WAIT_SECONDS = 5
 
 
-def extract_all_urls(html_content, base_url):
-    soup = BeautifulSoup(html_content, 'html.parser')
-    urls = {}
-
-    # Anchor tags
-    for tag in soup.find_all('a', href=True):
-        raw = tag['href'].strip()
-        if raw and raw not in ('#', 'javascript:void(0)', 'javascript:;'):
-            full = urljoin(base_url, raw)
-            label = (tag.get_text(strip=True) or tag.get('title', '') or raw)[:80]
-            urls[full] = {'url': full, 'label': label, 'type': 'anchor'}
-
-    # Script src
-    for tag in soup.find_all('script', src=True):
-        raw = tag['src'].strip()
-        if raw:
-            full = urljoin(base_url, raw)
-            urls[full] = {'url': full, 'label': raw[:80], 'type': 'script'}
-
-    # Link href
-    for tag in soup.find_all('link', href=True):
-        raw = tag['href'].strip()
-        if raw:
-            full = urljoin(base_url, raw)
-            rel = ' '.join(tag.get('rel', []))
-            urls[full] = {'url': full, 'label': rel or raw[:80], 'type': 'link'}
-
-    # Img src
-    for tag in soup.find_all('img', src=True):
-        raw = tag['src'].strip()
-        if raw:
-            full = urljoin(base_url, raw)
-            alt = tag.get('alt', '')[:80] or raw[:80]
-            urls[full] = {'url': full, 'label': alt, 'type': 'image'}
-
-    # iframe src
-    for tag in soup.find_all('iframe', src=True):
-        raw = tag['src'].strip()
-        if raw:
-            full = urljoin(base_url, raw)
-            urls[full] = {'url': full, 'label': raw[:80], 'type': 'iframe'}
-
-    # source src (video/audio)
-    for tag in soup.find_all('source', src=True):
-        raw = tag['src'].strip()
-        if raw:
-            full = urljoin(base_url, raw)
-            urls[full] = {'url': full, 'label': raw[:80], 'type': 'media-source'}
-
-    # data-src (lazy-loaded)
-    for tag in soup.find_all(attrs={'data-src': True}):
-        raw = tag['data-src'].strip()
-        if raw:
-            full = urljoin(base_url, raw)
-            urls[full] = {'url': full, 'label': raw[:80], 'type': 'lazy-src'}
-
-    # Inline JS / raw URL regex
-    inline_urls = re.findall(r'(?:https?://)[^\s\'"<>\)\]\}]+', html_content)
-    for u in inline_urls:
-        u = u.rstrip('.,;:')
-        if u not in urls:
-            urls[u] = {'url': u, 'label': u[:80], 'type': 'inline'}
-
-    return list(urls.values())
+def build_api_url(path):
+    # /movie/254  →  https://srtfile.github.io/vidnest/?r=%2Fmovie%2F254
+    from urllib.parse import quote
+    encoded = quote(path, safe='')
+    return f"{API_BASE}?r={encoded}"
 
 
 @app.route('/')
@@ -87,22 +25,25 @@ def index():
 
 @app.route('/fetch')
 def fetch():
+    path = "/movie/254"
+    api_url = build_api_url(path)
+
     headers = {
         'User-Agent': (
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
             'AppleWebKit/537.36 (KHTML, like Gecko) '
             'Chrome/124.0 Safari/537.36'
         ),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
+        'Accept': 'application/json, text/plain, */*',
+        'Referer': 'https://srtfile.github.io/',
     }
 
-    steps = [{'step': 1, 'msg': f'Navigating to {TARGET_URL}', 'status': 'ok'}]
+    steps = [{'step': 1, 'msg': f'Requesting {api_url}', 'status': 'ok'}]
 
     try:
-        resp = requests.get(TARGET_URL, headers=headers, timeout=20)
+        resp = requests.get(api_url, headers=headers, timeout=20)
         resp.raise_for_status()
-        steps.append({'step': 2, 'msg': f'Page loaded (HTTP {resp.status_code})', 'status': 'ok'})
+        steps.append({'step': 2, 'msg': f'Response received (HTTP {resp.status_code})', 'status': 'ok'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e), 'steps': steps})
 
@@ -110,24 +51,45 @@ def fetch():
     time.sleep(WAIT_SECONDS)
     steps.append({'step': 4, 'msg': 'Wait complete', 'status': 'ok'})
 
-    urls = extract_all_urls(resp.text, TARGET_URL)
-    steps.append({'step': 5, 'msg': f'Extracted {len(urls)} unique URLs', 'status': 'ok'})
+    try:
+        data = resp.json()
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'JSON parse failed: {e}', 'steps': steps})
 
-    by_type = {}
-    for u in urls:
-        by_type.setdefault(u['type'], []).append(u)
+    # Extract all stream URLs
+    servers = data.get('servers', [])
+    all_streams = []
+    ok_count = 0
+    error_count = 0
 
-    soup = BeautifulSoup(resp.text, 'html.parser')
-    page_title = soup.title.string if soup.title else 'N/A'
+    for srv in servers:
+        status = srv.get('status', 'error')
+        if status == 'ok':
+            ok_count += 1
+        else:
+            error_count += 1
+        for stream in srv.get('streams', []):
+            all_streams.append({
+                'server': srv['server'],
+                'url': stream['url'],
+                'type': stream.get('type', 'unknown'),
+                'status': status,
+            })
+
+    steps.append({'step': 5, 'msg': f'Found {len(all_streams)} stream URLs across {ok_count} working servers', 'status': 'ok'})
 
     return jsonify({
         'success': True,
-        'target': TARGET_URL,
-        'total': len(urls),
-        'urls': urls,
-        'by_type': by_type,
+        'api_url': api_url,
+        'query': data.get('query', {}),
+        'proxy': data.get('proxy', ''),
+        'total_servers': len(servers),
+        'ok_servers': ok_count,
+        'error_servers': error_count,
+        'total_streams': len(all_streams),
+        'servers': servers,
+        'all_streams': all_streams,
         'steps': steps,
-        'page_title': page_title,
     })
 
 
